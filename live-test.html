@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live会話テスト</title>
+<style>
+:root{--bg:#15171a;--panel:#1f2226;--line:#33373d;--text:#e8e8e8;--sub:#9aa0a6;--acc:#5fd3a5;--warn:#f0b35a;--bad:#ef6b6b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;font-size:15px}
+main{max-width:720px;margin:0 auto;padding:16px}
+h1{font-size:18px;margin:4px 0 12px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px}
+label{display:block;font-size:13px;color:var(--sub);margin:8px 0 4px}
+input[type=text],input[type=password],select,textarea{width:100%;background:#111316;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px;font-size:14px;font-family:inherit}
+textarea{min-height:90px;resize:vertical}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.row>*{flex:1;min-width:140px}
+.check{display:flex;gap:6px;align-items:center;font-size:13px;color:var(--text);margin-top:8px}
+button{background:var(--acc);color:#0b1a14;border:0;border-radius:8px;padding:12px 16px;font-size:16px;font-weight:700;cursor:pointer;width:100%}
+button.stop{background:var(--bad);color:#fff}
+#stage{display:flex;gap:16px;align-items:center}
+#face{width:110px;height:110px;flex:none;border-radius:50%;background:#2b2f35;position:relative;border:2px solid var(--line)}
+.eye{position:absolute;top:38px;width:12px;height:16px;background:var(--text);border-radius:6px}
+.eye.l{left:30px}.eye.r{right:30px}
+#mouth{position:absolute;left:50%;top:68px;width:30px;height:4px;background:var(--text);border-radius:12px;transform:translateX(-50%);transition:height .05s}
+#stats{flex:1;font-size:14px;line-height:1.7}
+#stats b{font-size:20px;color:var(--acc)}
+#status{font-size:13px;color:var(--sub)}
+#meter{height:6px;background:#111316;border-radius:3px;overflow:hidden;margin-top:6px}
+#meterBar{height:100%;width:0;background:var(--acc)}
+#log{font-size:14px;line-height:1.6;max-height:40vh;overflow-y:auto}
+#log .u{color:var(--sub)}
+#log .m{color:var(--text)}
+#log .sys{color:var(--warn);font-size:12px}
+details summary{cursor:pointer;color:var(--sub);font-size:14px}
+</style>
+</head>
+<body>
+<main>
+<h1>Live会話テスト</h1>
+
+<div class="panel" id="stage">
+  <div id="face"><div class="eye l"></div><div class="eye r"></div><div id="mouth"></div></div>
+  <div id="stats">
+    返事までの時間：<b id="lat">—</b><br>
+    平均：<span id="avg">—</span>（<span id="cnt">0</span>回）<br>
+    料金の目安：<span id="cost">$0.000</span>
+    <div id="status">未接続</div>
+    <div id="meter"><div id="meterBar"></div></div>
+  </div>
+</div>
+
+<div class="panel">
+  <button id="go">接続して話す</button>
+</div>
+
+<div class="panel">
+  <div id="log"></div>
+</div>
+
+<details class="panel">
+<summary>設定</summary>
+  <label>Gemini APIキー</label>
+  <input type="password" id="key" placeholder="AI Studioのキー">
+  <div class="check"><input type="checkbox" id="saveKey"><span>このブラウザにキーを保存</span></div>
+  <div class="row">
+    <div><label>モデル</label>
+      <select id="model">
+        <option value="gemini-3.8-live">gemini-3.8-live（標準）</option>
+        <option value="gemini-3.8-live-extended-thinking">gemini-3.8-live-extended-thinking（考える版・遅め）</option>
+        <option value="gemini-2.5-flash-native-audio-preview-12-2025">gemini-2.5 native audio（旧）</option>
+      </select></div>
+    <div><label>声</label>
+      <select id="voice">
+        <option>Puck</option><option>Kore</option><option>Aoede</option><option>Leda</option>
+        <option>Zephyr</option><option>Charon</option><option>Fenrir</option><option>Orus</option>
+      </select></div>
+  </div>
+  <label>キャラの指示</label>
+  <textarea id="sys">あなたは部屋に住んでいる小さなキャラクター。性格はプレーンで中性的、精神年齢は低めで、かわいげがある。日本語の話し言葉で、短く（1〜2文）返す。説明口調にしない。質問攻めにしない。</textarea>
+  <label>声を拾う感度（計測用。小さいほど敏感）</label>
+  <input type="text" id="th" value="0.02">
+  <div class="check"><input type="checkbox" id="half"><span>キャラが喋っている間はマイクを止める（スピーカーで使うとき用。割り込みはできなくなる）</span></div>
+</details>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const PRICE_IN = 0.005, PRICE_OUT = 0.018; // 1分あたりのドル（目安）
+
+try { const k = localStorage.getItem('liveKey'); if (k) { $('key').value = k; $('saveKey').checked = true; } } catch (e) {}
+
+let ws, inCtx, outCtx, stream, node, analyser;
+let running = false, playHead = 0;
+const sources = new Set();
+let inSec = 0, outSec = 0;
+let lastVoiceAt = 0, waitingReply = false, lats = [];
+let userText = '', modelText = '';
+
+function log(text, cls) {
+  const d = document.createElement('div'); d.className = cls; d.textContent = text;
+  $('log').appendChild(d); $('log').scrollTop = $('log').scrollHeight;
+}
+function status(t) { $('status').textContent = t; }
+function updateCost() { $('cost').textContent = '$' + (inSec / 60 * PRICE_IN + outSec / 60 * PRICE_OUT).toFixed(3); }
+
+function b64FromBuf(buf) {
+  const b = new Uint8Array(buf); let s = '';
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+const workletSrc = `
+class Rec extends AudioWorkletProcessor {
+  constructor(){ super(); this.buf = new Float32Array(640); this.n = 0; this.peak = 0; }
+  process(inputs){
+    const ch = inputs[0][0]; if(!ch) return true;
+    let s = 0; for (let i=0;i<ch.length;i++) s += ch[i]*ch[i];
+    this.peak = Math.max(this.peak, Math.sqrt(s/ch.length));
+    for (let i=0;i<ch.length;i++){
+      this.buf[this.n++] = ch[i];
+      if (this.n === 640){
+        const out = new Int16Array(640);
+        for (let j=0;j<640;j++){ const v = Math.max(-1, Math.min(1, this.buf[j])); out[j] = v < 0 ? v*0x8000 : v*0x7fff; }
+        this.port.postMessage({pcm: out.buffer, peak: this.peak}, [out.buffer]);
+        this.n = 0; this.peak = 0;
+      }
+    }
+    return true;
+  }
+}
+registerProcessor('rec', Rec);`;
+
+function playPCM(b64) {
+  const bin = atob(b64), n = bin.length >> 1;
+  const buf = outCtx.createBuffer(1, n, 24000), d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) {
+    let v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    if (v >= 32768) v -= 65536; d[i] = v / 32768;
+  }
+  const src = outCtx.createBufferSource(); src.buffer = buf; src.connect(analyser);
+  const t = Math.max(outCtx.currentTime + 0.02, playHead);
+  src.start(t); playHead = t + buf.duration;
+  sources.add(src); src.onended = () => sources.delete(src);
+  outSec += buf.duration; updateCost();
+}
+function stopPlayback() {
+  for (const s of sources) { try { s.stop(); } catch (e) {} }
+  sources.clear(); playHead = 0;
+}
+
+function onAudioChunk({ pcm, peak }) {
+  const th = parseFloat($('th').value) || 0.02;
+  $('meterBar').style.width = Math.min(100, peak * 400) + '%';
+  if (peak > th) { lastVoiceAt = performance.now(); waitingReply = true; }
+  if (!ws || ws.readyState !== 1 || !running) return;
+  if ($('half').checked && sources.size > 0) return;
+  ws.send(JSON.stringify({ realtimeInput: { audio: { data: b64FromBuf(pcm), mimeType: 'audio/pcm;rate=16000' } } }));
+  inSec += 0.04; updateCost();
+}
+
+async function handleMessage(ev) {
+  const raw = ev.data instanceof Blob ? await ev.data.text() : ev.data;
+  let msg; try { msg = JSON.parse(raw); } catch (e) { return; }
+  if (msg.setupComplete) { status('接続中。話しかけてみて'); running = true; return; }
+  const sc = msg.serverContent; if (!sc) return;
+  if (sc.interrupted) { stopPlayback(); log('（割り込みで停止）', 'sys'); }
+  if (sc.inputTranscription?.text) userText += sc.inputTranscription.text;
+  if (sc.outputTranscription?.text) modelText += sc.outputTranscription.text;
+  for (const p of sc.modelTurn?.parts || []) {
+    if (p.inlineData?.data) {
+      if (waitingReply && lastVoiceAt) {
+        const ms = performance.now() - lastVoiceAt;
+        lats.push(ms); waitingReply = false;
+        $('lat').textContent = (ms / 1000).toFixed(2) + '秒';
+        $('avg').textContent = (lats.reduce((a, b) => a + b, 0) / lats.length / 1000).toFixed(2) + '秒';
+        $('cnt').textContent = lats.length;
+      }
+      playPCM(p.inlineData.data);
+    }
+  }
+  if (sc.turnComplete || sc.generationComplete) {
+    if (userText.trim()) log('あなた：' + userText.trim(), 'u');
+    if (modelText.trim()) log('キャラ：' + modelText.trim(), 'm');
+    userText = ''; modelText = '';
+  }
+}
+
+async function start() {
+  const key = $('key').value.trim();
+  if (!key) { status('設定からAPIキーを入れてね'); document.querySelector('details').open = true; return; }
+  try { if ($('saveKey').checked) localStorage.setItem('liveKey', key); else localStorage.removeItem('liveKey'); } catch (e) {}
+
+  status('マイク準備中…');
+  stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+  inCtx = new AudioContext({ sampleRate: 16000 });
+  outCtx = new AudioContext({ sampleRate: 24000 });
+  analyser = outCtx.createAnalyser(); analyser.fftSize = 512; analyser.connect(outCtx.destination);
+  const url = URL.createObjectURL(new Blob([workletSrc], { type: 'application/javascript' }));
+  await inCtx.audioWorklet.addModule(url);
+  node = new AudioWorkletNode(inCtx, 'rec');
+  node.port.onmessage = e => onAudioChunk(e.data);
+  inCtx.createMediaStreamSource(stream).connect(node);
+
+  status('接続中…');
+  ws = new WebSocket('wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=' + encodeURIComponent(key));
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ setup: {
+      model: 'models/' + $('model').value,
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: $('voice').value } } }
+      },
+      systemInstruction: { parts: [{ text: $('sys').value }] },
+      inputAudioTranscription: {},
+      outputAudioTranscription: {}
+    } }));
+  };
+  ws.onmessage = handleMessage;
+  ws.onerror = () => log('接続エラー', 'sys');
+  ws.onclose = e => { log(`切断（${e.code}${e.reason ? '：' + e.reason : ''}）`, 'sys'); stop(); };
+
+  $('go').textContent = '止める'; $('go').classList.add('stop');
+  mouthLoop();
+}
+
+function stop() {
+  running = false;
+  try { ws && ws.readyState < 2 && ws.close(); } catch (e) {}
+  stopPlayback();
+  try { stream && stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { inCtx && inCtx.close(); } catch (e) {}
+  try { outCtx && outCtx.close(); } catch (e) {}
+  ws = null; stream = null;
+  status('未接続'); $('meterBar').style.width = '0';
+  $('go').textContent = '接続して話す'; $('go').classList.remove('stop');
+}
+
+function mouthLoop() {
+  if (!analyser || !outCtx || outCtx.state === 'closed') { $('mouth').style.height = '4px'; return; }
+  const d = new Float32Array(analyser.fftSize); analyser.getFloatTimeDomainData(d);
+  let s = 0; for (const v of d) s += v * v;
+  const rms = Math.sqrt(s / d.length);
+  $('mouth').style.height = (4 + Math.min(22, rms * 120)) + 'px';
+  requestAnimationFrame(mouthLoop);
+}
+
+$('go').onclick = () => {
+  if (ws) stop(); else start().catch(e => { log('開始できなかった：' + e.message, 'sys'); stop(); });
+};
+</script>
+</body>
+</html>
